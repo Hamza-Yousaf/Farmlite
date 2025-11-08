@@ -7,6 +7,13 @@ import "leaflet-draw";
 import type { LatLngExpression } from "leaflet";
 import LocationSearch from "./LocationSearch";
 import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { MapContainer, TileLayer, useMap, Marker, Popup } from 'react-leaflet'
+import L from 'leaflet'
+import 'leaflet-draw'
+import type { LatLngExpression } from 'leaflet'
+import LocationSearch from './LocationSearch'
 
 import icon from "leaflet/dist/images/marker-icon.png";
 import iconShadow from "leaflet/dist/images/marker-shadow.png";
@@ -28,27 +35,61 @@ interface InteractiveMapProps {
   coordinates: string | null;
   setCoordinates: (coords: string) => void;
   setRawCoordinates: (coords: LatLngExpression[]) => void;
+interface ShapeData {
+  type: string
+  coordinates: LatLngExpression[]
+  area: string
+  areaInSquareMeters: number
 }
 
-function CoordinatesDisplay({ coordinates }: CoordinatesDisplayProps) {
-  if (!coordinates) {
+interface ViewAnalysisButtonProps {
+  shapeData: ShapeData | null
+}
+
+function ViewAnalysisButton({ shapeData }: ViewAnalysisButtonProps) {
+  const router = useRouter()
+
+  if (!shapeData) {
     return (
       <div className="bg-gradient-to-br from-blue-50 to-purple-50 rounded-xl p-6 shadow-lg border-2 border-blue-200">
         <p className="text-purple-700 italic font-medium">
           Draw a polygon or rectangle on the map to see coordinates
         </p>
+      <div className="bg-gradient-to-br from-[#f5e6d3] to-[#ede4d3] rounded-xl p-6 shadow-lg border-2 border-amber-200/50">
+        <p className="text-muted-foreground italic font-medium text-center">Draw a polygon or rectangle on the map to analyze the area</p>
       </div>
     );
   }
 
+  const handleViewAnalysis = () => {
+    // Store shape data in localStorage for the analysis page
+    try {
+      localStorage.setItem('shapeData', JSON.stringify(shapeData))
+      // Navigate to analysis page using Next.js router
+      router.push('/analysis')
+    } catch (error) {
+      console.error('Error storing shape data:', error)
+    }
+  }
+
   return (
-    <div className="bg-gradient-to-br from-emerald-50 to-teal-50 rounded-xl p-6 shadow-lg border-2 border-emerald-300">
-      <h3 className="text-xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 bg-clip-text text-transparent mb-4">
-        Selected Area Coordinates:
-      </h3>
-      <pre className="bg-white/80 backdrop-blur-sm border-2 border-emerald-200 rounded-lg p-4 overflow-x-auto text-sm leading-relaxed text-gray-800 font-mono whitespace-pre-wrap break-words shadow-inner">
-        {coordinates}
-      </pre>
+    <div className="bg-gradient-to-br from-success/10 to-success/5 rounded-xl p-6 shadow-lg border-2 border-success/30">
+      <div className="text-center space-y-4">
+        <div>
+          <h3 className="text-xl font-bold text-success mb-2">
+            Area Selected Successfully!
+          </h3>
+          <p className="text-muted-foreground">
+            Shape: {shapeData.type} • Area: {shapeData.area}
+          </p>
+        </div>
+        <button
+          onClick={handleViewAnalysis}
+          className="w-full bg-success hover:bg-success/90 text-white font-semibold py-3 px-6 rounded-lg shadow-md border-2 border-success/30 transition-all duration-200 hover:shadow-lg hover:scale-105"
+        >
+          View Detailed Analysis
+        </button>
+      </div>
     </div>
   );
 }
@@ -71,6 +112,7 @@ function MapCenter({
 // DrawControl component
 interface DrawControlProps {
   onDrawComplete: (coordinates: string, rawCoords: LatLngExpression[]) => void;
+  onDrawComplete: (shapeData: ShapeData) => void
 }
 
 function DrawControl({ onDrawComplete }: DrawControlProps) {
@@ -131,9 +173,30 @@ function DrawControl({ onDrawComplete }: DrawControlProps) {
       // Send to parent
       onDrawComplete(coordinatesString, coords);
     };
+      // Calculate area
+      const areaInSquareMeters = calculateArea(layer as L.Rectangle | L.Polygon)
+      const areaString = formatArea(areaInSquareMeters)
+
+      // Create shape data object
+      const shapeData: ShapeData = {
+        type,
+        coordinates: coords,
+        area: areaString,
+        areaInSquareMeters: areaInSquareMeters
+      }
+
+      // Log to console
+      console.log('Shape Data:', shapeData)
 
     map.on(L.Draw.Event.CREATED as any, handleDrawCreated);
 
+      // Call the callback to update parent state
+      onDrawComplete(shapeData)
+    }
+
+    map.on(L.Draw.Event.CREATED as any, handleDrawCreated)
+
+    // Cleanup
     return () => {
       map.removeControl(drawControl);
       map.off(L.Draw.Event.CREATED as any, handleDrawCreated);
@@ -185,20 +248,84 @@ export default function InteractiveMap({
     },
     [setCoordinates, setRawCoordinates]
   );
+export default function InteractiveMap() {
+  const [shapeData, setShapeData] = useState<ShapeData | null>(null)
+  const [userLocation, setUserLocation] = useState<LatLngExpression | null>(null)
+  // Toronto, Canada coordinates (fallback)
+  const torontoCoords: LatLngExpression = [43.6532, -79.3832]
+  
+  const [searchedLocation, setSearchedLocation] = useState<LatLngExpression | null>(null)
+  const [searchedLocationName, setSearchedLocationName] = useState<string | null>(null)
+  const [mapCenter, setMapCenter] = useState<LatLngExpression | null>(torontoCoords)
+  const [mapZoom, setMapZoom] = useState<number>(13)
+  const [locationError, setLocationError] = useState<string | null>(null)
+  const [isLoadingLocation, setIsLoadingLocation] = useState(true)
+  
+  // Default center and zoom - prioritize searched location, then user location, then Toronto
+  const defaultCenter = mapCenter || userLocation || torontoCoords
+  const defaultZoom = mapZoom
+
+  useEffect(() => {
+    // Get user's current location on initial load
+    if ('geolocation' in navigator) {
+      setIsLoadingLocation(true)
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const { latitude, longitude } = position.coords
+          const location: LatLngExpression = [latitude, longitude]
+          setUserLocation(location)
+          // Only update map center if no location has been searched
+          if (!searchedLocation) {
+            setMapCenter(location)
+            setMapZoom(16)
+          }
+          setIsLoadingLocation(false)
+          setLocationError(null)
+        },
+        (error) => {
+          console.error('Error getting location:', error)
+          setLocationError('Unable to get your location. Using default location.')
+          setIsLoadingLocation(false)
+          setUserLocation(null)
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0,
+        }
+      )
+    } else {
+      setLocationError('Geolocation is not supported by your browser.')
+      setIsLoadingLocation(false)
+    }
+  }, [])
+
+  const handleDrawComplete = useCallback((data: ShapeData) => {
+    setShapeData(data)
+  }, [])
+
+  const handleLocationSearch = useCallback((coordinates: LatLngExpression, name: string) => {
+    setSearchedLocation(coordinates)
+    setSearchedLocationName(name)
+    setMapCenter(coordinates)
+    setMapZoom(15)
+  }, [])
 
   return (
     <div className="flex flex-col gap-6">
       {isLoadingLocation && !searchedLocation && (
-        <div className="bg-gradient-to-r from-blue-400 to-purple-400 text-white rounded-lg p-3 text-sm font-semibold shadow-lg animate-pulse">
+        <div className="bg-gradient-to-r from-success to-success/80 text-white rounded-lg p-3 text-sm font-semibold shadow-lg animate-pulse border border-success/30">
           ✨ Getting your location...
         </div>
       )}
       {locationError && !searchedLocation && (
-        <div className="bg-gradient-to-r from-amber-400 to-orange-400 text-white rounded-lg p-3 text-sm font-semibold shadow-lg">
+        <div className="bg-gradient-to-r from-amber-500 to-amber-600 text-white rounded-lg p-3 text-sm font-semibold shadow-lg border border-amber-600/30">
           ⚠️ {locationError}
         </div>
       )}
       <div className="relative rounded-xl overflow-hidden shadow-2xl bg-gradient-to-br from-white to-blue-50 p-2 border-2 border-blue-200">
+      <div className="relative rounded-xl overflow-hidden shadow-2xl bg-gradient-to-br from-white to-[#faf5e6] p-2 border-2 border-amber-200/50">
+        {/* Location Search Bar - Positioned over map with high z-index */}
         <div className="absolute top-4 left-4 right-4 z-[1000]">
           <LocationSearch onLocationSelect={handleLocationSearch} />
         </div>
@@ -227,7 +354,7 @@ export default function InteractiveMap({
           <DrawControl onDrawComplete={handleDrawComplete} />
         </MapContainer>
       </div>
-      <CoordinatesDisplay coordinates={coordinates} />
+      <ViewAnalysisButton shapeData={shapeData} />
     </div>
   );
 }
